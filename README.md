@@ -3,10 +3,6 @@
 Sentinel - motion-activated alarm for Raspberry Pi
 ==================================================
 
-Same behaviour as before, but the servo is driven by a small PCA9685
-driver built into this file, so the adafruit ServoKit library is NOT needed.
-It only uses smbus (preinstalled on Raspberry Pi OS, or: sudo apt install python3-smbus).
-
 What it does
   * Watches a PIR sensor and counts every detection with a timestamp.
   * On detection: beeps the buzzer, tells the Arduino to flash the alarm
@@ -18,7 +14,7 @@ Hardware map
   PIR sensor .......... GPIO 27
   Buzzer .............. GPIO 22
   Reset button ........ GPIO 4   (3-pin module, idle HIGH, LOW when pressed)
-  PCA9685 ............. I2C (address 0x40), servo on channel 0, V+ from external 5 V
+  PCA9685 ............. I2C, servo on channel 0, V+ from external 5 V
   Arduino ............. USB serial (/dev/ttyUSB0) - LEDs and 16x2 LCD
 """
 
@@ -30,12 +26,9 @@ import serial
 from gpiozero import Button, Buzzer, MotionSensor
 
 try:
-    from smbus2 import SMBus
+    from adafruit_servokit import ServoKit
 except ImportError:
-    try:
-        from smbus import SMBus
-    except ImportError:
-        SMBus = None
+    ServoKit = None
 
 
 # --------------------------------------------------------------------------
@@ -49,11 +42,7 @@ class Config:
     ARDUINO_PORT = "/dev/ttyUSB0"
     ARDUINO_BAUD = 9600
 
-    I2C_BUS = 1              # Raspberry Pi header I2C bus
-    PCA9685_ADDRESS = 0x40
     SERVO_CHANNEL = 0
-    SERVO_MIN_US = 500       # pulse width at 0 degrees (microseconds)
-    SERVO_MAX_US = 2500      # pulse width at 180 degrees (microseconds)
     SERVO_REST = 90          # degrees, where the servo parks
     SERVO_SWEEP = (180, 0)   # positions visited during a scan
     SERVO_PAUSE = 1.0        # seconds to hold each sweep position
@@ -70,40 +59,6 @@ def now() -> str:
 def log(message: str) -> None:
     print(f"[{now()}] {message}")
     sys.stdout.flush()
-
-
-# --------------------------------------------------------------------------
-# Minimal PCA9685 driver (replaces adafruit ServoKit)
-# --------------------------------------------------------------------------
-class PCA9685:
-    MODE1 = 0x00
-    PRESCALE = 0xFE
-    LED0_ON_L = 0x06
-
-    def __init__(self, bus_number: int, address: int, frequency: int = 50):
-        self.bus = SMBus(bus_number)
-        self.address = address
-        self.period_us = 1_000_000 / frequency
-
-        prescale = int(round(25_000_000 / (4096 * frequency)) - 1)
-        self.bus.write_byte_data(self.address, self.MODE1, 0x10)       # sleep
-        self.bus.write_byte_data(self.address, self.PRESCALE, prescale)
-        self.bus.write_byte_data(self.address, self.MODE1, 0x20)       # wake, auto-increment
-        time.sleep(0.005)
-        self.bus.write_byte_data(self.address, self.MODE1, 0xA0)       # restart
-
-    def set_pulse_us(self, channel: int, pulse_us: float) -> None:
-        ticks = int(pulse_us / self.period_us * 4096)
-        ticks = max(0, min(4095, ticks))
-        reg = self.LED0_ON_L + 4 * channel
-        self.bus.write_i2c_block_data(
-            self.address, reg, [0, 0, ticks & 0xFF, ticks >> 8]
-        )
-
-    def off(self, channel: int) -> None:
-        """Stop sending pulses on a channel (servo goes limp)."""
-        reg = self.LED0_ON_L + 4 * channel
-        self.bus.write_i2c_block_data(self.address, reg, [0, 0, 0, 0x10])
 
 
 # --------------------------------------------------------------------------
@@ -134,33 +89,26 @@ class ArduinoLink:
 # --------------------------------------------------------------------------
 class Scanner:
     def __init__(self, channel: int):
-        self.channel = channel
-        self.driver = None
-        if SMBus is None:
-            log("smbus not installed - scanner disabled (sudo apt install python3-smbus)")
+        self.servo = None
+        if ServoKit is None:
+            log("adafruit_servokit not installed - scanner disabled")
             return
         try:
-            self.driver = PCA9685(Config.I2C_BUS, Config.PCA9685_ADDRESS)
+            self.servo = ServoKit(channels=16).servo[channel]
             self.park()
         except Exception as exc:  # board missing or I2C fault
             log(f"PCA9685 not found ({exc}) - scanner disabled")
-            self.driver = None
-
-    def _move(self, angle: float) -> None:
-        span = Config.SERVO_MAX_US - Config.SERVO_MIN_US
-        pulse = Config.SERVO_MIN_US + (angle / 180.0) * span
-        self.driver.set_pulse_us(self.channel, pulse)
 
     def park(self) -> None:
-        if self.driver is not None:
-            self._move(Config.SERVO_REST)
+        if self.servo is not None:
+            self.servo.angle = Config.SERVO_REST
 
     def sweep(self) -> None:
-        if self.driver is None:
+        if self.servo is None:
             return
         log("Scanning area...")
         for angle in Config.SERVO_SWEEP:
-            self._move(angle)
+            self.servo.angle = angle
             time.sleep(Config.SERVO_PAUSE)
         self.park()
         time.sleep(0.5)
